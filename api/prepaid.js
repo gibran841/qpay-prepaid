@@ -12,6 +12,7 @@ function b64url(data) {
 
 function makeTicket(sellerId, ticketKey, resourceId, amount) {
   const now = Math.floor(Date.now() / 1000);
+
   const claims = {
     v: "pt1",
     sellerId,
@@ -31,6 +32,16 @@ function makeTicket(sellerId, ticketKey, resourceId, amount) {
   return `${payload}.${signature}`;
 }
 
+function decodeHeader(value) {
+  if (typeof value !== "string") {
+    throw new Error("Missing header");
+  }
+
+  return JSON.parse(
+    Buffer.from(value, "base64").toString("utf8")
+  );
+}
+
 async function facilitatorPost(path, body) {
   const response = await fetch(`${FACILITATOR}${path}`, {
     method: "POST",
@@ -39,12 +50,23 @@ async function facilitatorPost(path, body) {
   });
 
   const data = await response.json().catch(() => ({}));
-  return { status: response.status, data };
+
+  return {
+    status: response.status,
+    data
+  };
 }
 
 module.exports = async function handler(req, res) {
   res.setHeader("Content-Type", "application/json");
   res.setHeader("Cache-Control", "no-store");
+
+  if (req.method !== "GET" && req.method !== "POST") {
+    res.setHeader("Allow", "GET, POST");
+    return res.status(405).json({
+      error: "Method not allowed"
+    });
+  }
 
   const sellerId = process.env.QUBIC_ADDRESS;
   const ticketKey = process.env.QPAY_TICKET_KEY;
@@ -52,17 +74,18 @@ module.exports = async function handler(req, res) {
   if (!sellerId || !ticketKey) {
     return res.status(500).json({
       error: "Server configuration missing",
-      required: ["QUBIC_ADDRESS", "QPAY_TICKET_KEY"]
+      required: [
+        "QUBIC_ADDRESS",
+        "QPAY_TICKET_KEY"
+      ]
     });
   }
 
-  if (req.method !== "GET" && req.method !== "POST") {
-    res.setHeader("Allow", "GET, POST");
-    return res.status(405).json({ error: "Method not allowed" });
-  }
-
   try {
-    const supportedResponse = await fetch(`${FACILITATOR}/supported`);
+    const supportedResponse = await fetch(
+      `${FACILITATOR}/supported`
+    );
+
     if (!supportedResponse.ok) {
       return res.status(502).json({
         error: "Could not load facilitator configuration"
@@ -93,10 +116,12 @@ module.exports = async function handler(req, res) {
       }
     });
 
-    const openRequirements = makeRequirements("channel:open", DEPOSIT);
-    const openTicket = makeTicket(
-      sellerId,
-      ticketKey,
+    const regularRequirements = makeRequirements(
+      RESOURCE,
+      PRICE
+    );
+
+    const openRequirements = makeRequirements(
       "channel:open",
       DEPOSIT
     );
@@ -104,17 +129,30 @@ module.exports = async function handler(req, res) {
     if (req.method === "GET") {
       return res.status(402).json({
         x402Version: 2,
-        error: "Prepaid channel payment required",
-        accepts: [makeRequirements(RESOURCE, PRICE)],
+        error: "Payment required",
+        accepts: [regularRequirements],
+        paymentTicket: makeTicket(
+          sellerId,
+          ticketKey,
+          RESOURCE,
+          PRICE
+        ),
+        paymentTicketField: "paymentPayload.payload.ticket",
         channel: {
           deposit: DEPOSIT,
           price: PRICE,
           requirements: openRequirements,
-          ticket: openTicket,
+          ticket: makeTicket(
+            sellerId,
+            ticketKey,
+            "channel:open",
+            DEPOSIT
+          ),
           openHeader: "X-CHANNEL-OPEN",
           voucherHeader: "X-CHANNEL-VOUCHER",
+          channelId: `<buyer-address>:${sellerId}`,
           voucherMessage:
-            "Sign channel:<buyer-address>:<seller-address>:<cumulativeAmount> according to the Q+Pay prepaid channel protocol",
+            "channel:<channelId>:<cumulativeAmount>",
           balanceUrl: `${FACILITATOR}/channel`
         }
       });
@@ -122,45 +160,106 @@ module.exports = async function handler(req, res) {
 
     const openHeader = req.headers["x-channel-open"];
     const voucherHeader = req.headers["x-channel-voucher"];
+    const paymentHeader = req.headers["x-payment"];
 
-    if (!openHeader || !voucherHeader) {
-      return res.status(402).json({
-        error: "Both X-CHANNEL-OPEN and X-CHANNEL-VOUCHER are required"
+    // Standard x402 payment.
+    if (paymentHeader && !voucherHeader) {
+      let paymentPayload;
+
+      try {
+        paymentPayload = decodeHeader(paymentHeader);
+      } catch {
+        return res.status(400).json({
+          error: "Invalid X-PAYMENT encoding"
+        });
+      }
+
+      const result = await facilitatorPost("/settle", {
+        paymentPayload,
+        paymentRequirements: regularRequirements
+      });
+
+      if (!result.data.success) {
+        return res.status(
+          result.status === 402 ? 402 : 502
+        ).json({
+          error: "Payment could not be settled",
+          details: result.data
+        });
+      }
+
+      return res.status(200).json({
+        success: true,
+        message: "Payment accepted",
+        payment: result.data
       });
     }
 
-    let paymentPayload;
+    if (!voucherHeader) {
+      return res.status(402).json({
+        error: "X-CHANNEL-VOUCHER is required"
+      });
+    }
+
     let voucher;
 
     try {
-      paymentPayload = JSON.parse(
-        Buffer.from(openHeader, "base64").toString("utf8")
-      );
-      voucher = JSON.parse(
-        Buffer.from(voucherHeader, "base64").toString("utf8")
-      );
+      voucher = decodeHeader(voucherHeader);
     } catch {
-      return res.status(400).json({ error: "Invalid channel header encoding" });
+      return res.status(400).json({
+        error: "Invalid channel voucher encoding"
+      });
     }
+
+    const channelParts =
+      typeof voucher.channelId === "string"
+        ? voucher.channelId.split(":")
+        : [];
 
     if (
-      !voucher.channelId ||
-      !/^[0-9]+$/.test(String(voucher.cumulativeAmount)) ||
-      !/^[0-9a-f]{128}$/.test(String(voucher.signature))
+      channelParts.length !== 2 ||
+      !channelParts[0] ||
+      channelParts[1] !== sellerId ||
+      !/^[0-9]+$/.test(
+        String(voucher.cumulativeAmount)
+      ) ||
+      !/^[0-9a-f]{128}$/.test(
+        String(voucher.signature)
+      )
     ) {
-      return res.status(400).json({ error: "Invalid voucher fields" });
+      return res.status(400).json({
+        error: "Invalid voucher fields"
+      });
     }
 
-    const openResult = await facilitatorPost("/channel/open", {
-      paymentPayload,
-      paymentRequirements: openRequirements
-    });
+    // Open the channel only when a deposit payload is supplied.
+    if (openHeader) {
+      let paymentPayload;
 
-    if (!openResult.data.success) {
-      return res.status(openResult.status === 402 ? 402 : 502).json({
-        error: "Channel deposit could not be opened",
-        details: openResult.data
-      });
+      try {
+        paymentPayload = decodeHeader(openHeader);
+      } catch {
+        return res.status(400).json({
+          error: "Invalid X-CHANNEL-OPEN encoding"
+        });
+      }
+
+      const openResult = await facilitatorPost(
+        "/channel/open",
+        {
+          paymentPayload,
+          paymentRequirements: openRequirements
+        }
+      );
+
+      if (!openResult.data.success) {
+        return res.status(
+          openResult.status === 402 ? 402 : 502
+        ).json({
+          error: "Channel deposit could not be opened",
+          details: openResult.data
+        });
+      }
     }
 
     const message = [
@@ -175,17 +274,24 @@ module.exports = async function handler(req, res) {
       .update(message)
       .digest("hex");
 
-    const redeemResult = await facilitatorPost("/channel/redeem", {
-      channelId: voucher.channelId,
-      sellerId,
-      price: PRICE,
-      cumulativeAmount: String(voucher.cumulativeAmount),
-      signature: voucher.signature,
-      sellerAuth
-    });
+    const redeemResult = await facilitatorPost(
+      "/channel/redeem",
+      {
+        channelId: voucher.channelId,
+        sellerId,
+        price: PRICE,
+        cumulativeAmount: String(
+          voucher.cumulativeAmount
+        ),
+        signature: voucher.signature,
+        sellerAuth
+      }
+    );
 
     if (!redeemResult.data.success) {
-      return res.status(redeemResult.status === 402 ? 402 : 502).json({
+      return res.status(
+        redeemResult.status === 402 ? 402 : 502
+      ).json({
         error: "Channel voucher could not be redeemed",
         details: redeemResult.data
       });
@@ -201,7 +307,7 @@ module.exports = async function handler(req, res) {
       message: "Prepaid channel request accepted",
       channelId: voucher.channelId,
       price: PRICE,
-      result: "Q+Pay prepaid channel"
+      remaining: redeemResult.data.remaining ?? null
     });
   } catch (error) {
     return res.status(502).json({
